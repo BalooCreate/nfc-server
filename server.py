@@ -1,6 +1,6 @@
 import logging
 from logging.handlers import RotatingFileHandler
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Set
 import os
 
 from fastapi import FastAPI, Header, HTTPException, Request, Response
@@ -77,6 +77,7 @@ class ApduRequest(BaseModel):
 class ApduResponse(BaseModel):
     response_apdu: str
     status: str = "ok"
+    paired: bool = False
 
 
 class NdefRecord(BaseModel):
@@ -114,12 +115,22 @@ class SetTagConfigRequest(BaseModel):
     ndef_records: Optional[List[NdefRecord]] = None
 
 
+class SessionStatusResponse(BaseModel):
+    session_id: str
+    status: str
+    clients: int
+
+
 # =========================
 # STORAGE (IN-MEMORY)
 # =========================
 
 tag_configs: Dict[str, TagConfigResponse] = {}
 last_apdu_per_session: Dict[str, str] = {}
+
+# AUTO-PAIRING
+session_clients: Dict[str, Set[str]] = {}
+session_status: Dict[str, str] = {}
 
 
 # =========================
@@ -131,13 +142,27 @@ def check_auth(authorization: Optional[str]) -> None:
         return
 
     if not authorization or not authorization.startswith("Bearer "):
-        logger.warning("Cerere fără token valid")
         raise HTTPException(status_code=401, detail="Missing or invalid token")
 
     token = authorization.split(" ", 1)[1].strip()
     if token != API_KEY:
-        logger.warning("Token invalid")
         raise HTTPException(status_code=403, detail="Invalid API token")
+
+
+# =========================
+# PAIRING LOGIC
+# =========================
+
+def update_pairing(session_id: str, client_id: str):
+    if session_id not in session_clients:
+        session_clients[session_id] = set()
+
+    session_clients[session_id].add(client_id)
+
+    if len(session_clients[session_id]) >= 2:
+        session_status[session_id] = "paired"
+    else:
+        session_status[session_id] = "waiting"
 
 
 # =========================
@@ -167,10 +192,7 @@ app.add_middleware(
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     logger.exception(f"Eroare neașteptată la {request.url}: {exc}")
-    return JSONResponse(
-        status_code=500,
-        content={"detail": "Internal server error"}
-    )
+    return JSONResponse(status_code=500, content={"detail": "Internal server error"})
 
 
 # =========================
@@ -179,28 +201,13 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 @app.get("/status")
 async def status():
-    return {
-        "status": "online",
-        "server": SERVER_NAME,
-        "version": VERSION
-    }
-
-
-@app.get("/info")
-async def info():
-    return {
-        "server": SERVER_NAME,
-        "version": VERSION,
-        "apdu_endpoint": "/apdu",
-        "tag_config_endpoint": "/tag/config",
-        "tag_event_endpoint": "/tag/event",
-        "sessions_endpoint": "/sessions",
-    }
+    return {"status": "online", "server": SERVER_NAME, "version": VERSION}
 
 
 @app.post("/apdu", response_model=ApduResponse)
 async def handle_apdu(
     req: ApduRequest,
+    request: Request,
     authorization: Optional[str] = Header(None)
 ):
     check_auth(authorization)
@@ -209,89 +216,66 @@ async def handle_apdu(
     if not session_id:
         raise HTTPException(status_code=400, detail="session_id cannot be empty")
 
-    cmd = req.command_apdu.upper().replace(" ", "")
-    logger.info(f"[APDU] session={session_id} cmd={cmd}")
+    client_id = f"{request.client.host}:{request.client.port}"
+    update_pairing(session_id, client_id)
 
+    cmd = req.command_apdu.upper().replace(" ", "")
     last_apdu_per_session[session_id] = cmd
 
-    return ApduResponse(response_apdu="9000")
+    paired = session_status.get(session_id) == "paired"
+
+    logger.info(
+        f"[APDU] session={session_id} client={client_id} paired={paired}"
+    )
+
+    return ApduResponse(response_apdu="9000", paired=paired)
 
 
 @app.post("/tag/event")
 async def tag_event(
     event: TagEvent,
+    request: Request,
     authorization: Optional[str] = Header(None)
 ):
     check_auth(authorization)
-    logger.info(f"[TAG EVENT] session={event.session_id} type={event.type}")
-    return {"status": "ok"}
+
+    client_id = f"{request.client.host}:{request.client.port}"
+    update_pairing(event.session_id, client_id)
+
+    paired = session_status.get(event.session_id) == "paired"
+
+    logger.info(
+        f"[TAG EVENT] session={event.session_id} client={client_id} paired={paired}"
+    )
+
+    return {"status": "ok", "paired": paired}
 
 
-@app.get("/tag/config", response_model=TagConfigResponse)
-async def tag_config(
+@app.get("/session/status", response_model=SessionStatusResponse)
+async def get_session_status(
     session_id: str,
     authorization: Optional[str] = Header(None)
 ):
     check_auth(authorization)
 
-    sid = session_id.strip()
-    if not sid:
-        raise HTTPException(status_code=400, detail="session_id cannot be empty")
+    clients = len(session_clients.get(session_id, set()))
+    status = session_status.get(session_id, "waiting")
 
-    if sid not in tag_configs:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No tag configuration found for session '{sid}'"
-        )
-
-    cfg = tag_configs[sid]
-    logger.info(f"[TAG CONFIG] session={sid} -> {cfg.model_dump_json()}")
-    return cfg
-
-
-@app.get("/sessions")
-async def list_sessions(authorization: Optional[str] = Header(None)):
-    check_auth(authorization)
-    return {"sessions": last_apdu_per_session}
-
-
-@app.post("/admin/set_tag")
-async def set_tag_config(
-    data: SetTagConfigRequest,
-    authorization: Optional[str] = Header(None)
-):
-    check_auth(authorization)
-
-    sid = data.session_id.strip()
-    if not sid:
-        raise HTTPException(status_code=400, detail="session_id cannot be empty")
-
-    cfg = TagConfigResponse(
-        mode=data.mode,
-        tag_id=data.tag_id,
-        ndef_records=data.ndef_records,
+    return SessionStatusResponse(
+        session_id=session_id,
+        status=status,
+        clients=clients
     )
-
-    tag_configs[sid] = cfg
-    logger.info(f"[ADMIN] Set TAG CONFIG for session={sid}: {cfg.model_dump_json()}")
-
-    return {"status": "ok", "session_id": sid}
 
 
 @app.post("/nfc-bin")
 async def handle_nfc_bin(request: Request):
-    try:
-        data = await request.body()
-        if not data:
-            raise HTTPException(status_code=400, detail="Empty body")
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Bad request: {e}")
+    data = await request.body()
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty body")
 
     response_data = process_nfc_bin(data)
-    return Response(
-        content=response_data,
-        media_type="application/octet-stream"
-    )
+    return Response(content=response_data, media_type="application/octet-stream")
 
 
 # =========================
@@ -299,21 +283,13 @@ async def handle_nfc_bin(request: Request):
 # =========================
 
 def process_nfc_bin(data: bytes) -> bytes:
-    if len(data) == 0:
-        return b"Error: Empty command"
-
     command_type = data[0:1]
 
     if command_type == b"\x01":
-        logger.info("Comandă de tip 1 primită")
         return b"ACK: Comanda 1 procesata"
-
     elif command_type == b"\x02":
-        logger.info("Comandă de tip 2 primită")
         return b"ACK: Comanda 2 procesata"
-
     else:
-        logger.warning(f"Comandă necunoscută: {command_type.hex()}")
         return b"Error: Comanda necunoscuta"
 
 
@@ -323,9 +299,14 @@ def process_nfc_bin(data: bytes) -> bytes:
 
 if __name__ == "__main__":
     import uvicorn
-    import os
 
-    # Citește portul din mediul de execuție (ex: Railway)
     port = int(os.getenv("PORT", str(settings.default_port)))
     logger.info(f"Pornesc {SERVER_NAME} pe portul {port}")
-    uvicorn.run("server:app", host="0.0.0.0", port=port, reload=False, workers=1)
+
+    uvicorn.run(
+        "server:app",
+        host="0.0.0.0",
+        port=port,
+        reload=False,
+        workers=1
+    )
