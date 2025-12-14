@@ -1,13 +1,12 @@
 import logging
 from logging.handlers import RotatingFileHandler
-from typing import List, Optional, Dict, Set
+from typing import Dict, Optional
 import os
 
-from fastapi import FastAPI, Header, HTTPException, Request, Response
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, HttpUrl, field_validator, ConfigDict
-from pydantic_settings import BaseSettings
+from pydantic import BaseModel, BaseSettings
 
 
 # =========================
@@ -22,7 +21,8 @@ class Settings(BaseSettings):
     log_file: str = "nfc_server.log"
     log_level: str = "INFO"
 
-    model_config = ConfigDict(env_file=".env", env_file_encoding="utf-8")
+    class Config:
+        env_file = ".env"
 
 
 settings = Settings()
@@ -36,7 +36,9 @@ logger = logging.getLogger("nfc_server")
 logger.setLevel(logging.INFO)
 
 if not logger.handlers:
-    handler = RotatingFileHandler("nfc_server.log", maxBytes=1_000_000, backupCount=3)
+    handler = RotatingFileHandler(
+        settings.log_file, maxBytes=1_000_000, backupCount=3
+    )
     formatter = logging.Formatter(
         "%(asctime)s [%(levelname)s] %(message)s",
         "%Y-%m-%d %H:%M:%S"
@@ -62,7 +64,7 @@ class ApduResponse(BaseModel):
 
 class TagEvent(BaseModel):
     session_id: str
-    type: str  # reader / tag
+    type: str   # reader / tag
 
 
 # =========================
@@ -184,11 +186,11 @@ async def roles(session_id: str):
 
 
 # =========================
-# MAIN
+# MAIN (LOCAL ONLY)
 # =========================
 
 if __name__ == "__main__":
     import uvicorn
 
     port = int(os.getenv("PORT", settings.default_port))
-    uvicorn.run("server:app", host="0.0.0.0", port=port)
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
