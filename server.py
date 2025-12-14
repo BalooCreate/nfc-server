@@ -323,14 +323,9 @@ def process_nfc_bin(data: bytes) -> bytes:
 
 if __name__ == "__main__":
     import uvicorn
+    import os
 
+    # Citește portul din mediul de execuție (ex: Railway)
     port = int(os.getenv("PORT", str(settings.default_port)))
     logger.info(f"Pornesc {SERVER_NAME} pe portul {port}")
-
-    uvicorn.run(
-        "server:app",
-        host="0.0.0.0",
-        port=port,
-        reload=False,
-        workers=1
-    )
+    uvicorn.run("server:app", host="0.0.0.0", port=port, reload=False, workers=1)
