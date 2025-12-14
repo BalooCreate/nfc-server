@@ -317,7 +317,38 @@ async def set_tag_config(
     logger.info(f"[ADMIN] Set TAG CONFIG for session={sid}: {cfg.json()}")
 
     return {"status": "ok", "session_id": sid}
+#... (Restul codului rămâne neschimbat)
 
+# --------- ENDPOINT PENTRU DATURI BINARE ---------
+
+@app.post("/nfc-bin")
+async def handle_nfc_bin(request: Request):
+    try:
+        # Citește datele binare din cerere
+        data = await request.body()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Bad request: {e}")
+
+    # Procesarea datelor binare
+    response_data = process_nfc_bin(data)
+
+    return Response(content=response_data, media_type="application/octet-stream")
+
+def process_nfc_bin(data: bytes) -> bytes:
+    # Extragerea informațiilor din mesaj
+    command_type = data[0:1]  # Primul byte pentru tipul comenzii
+    command_data = data[1:]    # Restul datelor
+
+    # Implementarea logicii pentru comenzi
+    if command_type == b'\x01':
+        logger.info("Comandă de tip 1 primită")
+        return b"ACK: Comandă 1 procesată"
+    elif command_type == b'\x02':
+        logger.info("Comandă de tip 2 primită")
+        return b"ACK: Comandă 2 procesată"
+    
+    logger.warning("Comandă necunoscută primită")
+    return b"Error: Comandă necunoscută"
 
 # ==============================
 #   PORNIRE UVICORN (pt. stand-alone)
