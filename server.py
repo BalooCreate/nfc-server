@@ -22,22 +22,10 @@ class Settings(BaseSettings):
     log_file: str = "nfc_server.log"
     log_level: str = "INFO"
 
-    model_config = ConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
-    )
+    model_config = ConfigDict(env_file=".env", env_file_encoding="utf-8")
 
 
 settings = Settings()
-
-API_KEY = settings.api_key
-SERVER_NAME = settings.server_name
-VERSION = settings.version
-LOG_FILE = settings.log_file
-LOG_LEVEL = settings.log_level.upper()
-
-MAX_LOG_SIZE = 1 * 1024 * 1024
-BACKUP_COUNT = 5
 
 
 # =========================
@@ -45,23 +33,16 @@ BACKUP_COUNT = 5
 # =========================
 
 logger = logging.getLogger("nfc_server")
-logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+logger.setLevel(logging.INFO)
 
 if not logger.handlers:
-    file_handler = RotatingFileHandler(
-        LOG_FILE,
-        maxBytes=MAX_LOG_SIZE,
-        backupCount=BACKUP_COUNT,
-        encoding="utf-8"
-    )
-
+    handler = RotatingFileHandler("nfc_server.log", maxBytes=1_000_000, backupCount=3)
     formatter = logging.Formatter(
-        "%(asctime)s [%(levelname)s] %(name)s - %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
+        "%(asctime)s [%(levelname)s] %(message)s",
+        "%Y-%m-%d %H:%M:%S"
     )
-
-    file_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
     logger.addHandler(logging.StreamHandler())
 
 
@@ -76,123 +57,73 @@ class ApduRequest(BaseModel):
 
 class ApduResponse(BaseModel):
     response_apdu: str
-    status: str = "ok"
-    paired: bool = False
-
-
-class NdefRecord(BaseModel):
-    record_type: str
-    lang: Optional[str] = None
-    text: Optional[str] = None
-    uri: Optional[HttpUrl] = None
-
-    @field_validator("uri", mode="before")
-    @classmethod
-    def strip_uri(cls, v):
-        if isinstance(v, str):
-            return v.strip()
-        return v
+    paired: bool
 
 
 class TagEvent(BaseModel):
     session_id: str
-    type: str
-    tag_id: Optional[str] = None
-    tech: Optional[List[str]] = None
-    ndef_records: Optional[List[NdefRecord]] = None
-
-
-class TagConfigResponse(BaseModel):
-    mode: str
-    tag_id: Optional[str] = None
-    ndef_records: Optional[List[NdefRecord]] = None
-
-
-class SetTagConfigRequest(BaseModel):
-    session_id: str
-    mode: str
-    tag_id: Optional[str] = None
-    ndef_records: Optional[List[NdefRecord]] = None
-
-
-class SessionStatusResponse(BaseModel):
-    session_id: str
-    status: str
-    clients: int
+    type: str  # reader / tag
 
 
 # =========================
-# STORAGE (IN-MEMORY)
+# STORAGE
 # =========================
 
-tag_configs: Dict[str, TagConfigResponse] = {}
-last_apdu_per_session: Dict[str, str] = {}
-
-# AUTO-PAIRING
-session_clients: Dict[str, Set[str]] = {}
-session_status: Dict[str, str] = {}
+session_roles: Dict[str, Dict[str, str]] = {}
+last_apdu: Dict[str, str] = {}
 
 
 # =========================
 # AUTH
 # =========================
 
-def check_auth(authorization: Optional[str]) -> None:
-    if not API_KEY:
+def check_auth(auth: Optional[str]):
+    if not settings.api_key:
         return
-
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing or invalid token")
-
-    token = authorization.split(" ", 1)[1].strip()
-    if token != API_KEY:
-        raise HTTPException(status_code=403, detail="Invalid API token")
+    if not auth or not auth.startswith("Bearer "):
+        raise HTTPException(401, "Unauthorized")
+    if auth.split(" ", 1)[1] != settings.api_key:
+        raise HTTPException(403, "Forbidden")
 
 
 # =========================
-# PAIRING LOGIC
+# ROLE LOGIC
 # =========================
 
-def update_pairing(session_id: str, client_id: str):
-    if session_id not in session_clients:
-        session_clients[session_id] = set()
+def register_role(session_id: str, role: str, client_id: str):
+    if session_id not in session_roles:
+        session_roles[session_id] = {}
 
-    session_clients[session_id].add(client_id)
+    role = role.lower()
+    if role in ("reader", "reader_mode"):
+        session_roles[session_id]["reader"] = client_id
+    elif role in ("tag", "card", "emulation"):
+        session_roles[session_id]["tag"] = client_id
 
-    if len(session_clients[session_id]) >= 2:
-        session_status[session_id] = "paired"
-    else:
-        session_status[session_id] = "waiting"
+
+def is_paired(session_id: str) -> bool:
+    roles = session_roles.get(session_id, {})
+    return "reader" in roles and "tag" in roles
 
 
 # =========================
 # APP
 # =========================
 
-app = FastAPI(
-    title=SERVER_NAME,
-    version=VERSION,
-    docs_url="/docs",
-    redoc_url="/redoc",
-)
+app = FastAPI(title=settings.server_name, version=settings.version)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-# =========================
-# ERROR HANDLER
-# =========================
-
 @app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception):
-    logger.exception(f"Eroare neașteptată la {request.url}: {exc}")
-    return JSONResponse(status_code=500, content={"detail": "Internal server error"})
+async def err(_, e: Exception):
+    logger.exception(e)
+    return JSONResponse(500, {"error": "internal"})
 
 
 # =========================
@@ -201,34 +132,12 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 @app.get("/status")
 async def status():
-    return {"status": "online", "server": SERVER_NAME, "version": VERSION}
+    return {"status": "online"}
 
 
-@app.post("/apdu", response_model=ApduResponse)
-async def handle_apdu(
-    req: ApduRequest,
-    request: Request,
-    authorization: Optional[str] = Header(None)
-):
-    check_auth(authorization)
-
-    session_id = req.session_id.strip()
-    if not session_id:
-        raise HTTPException(status_code=400, detail="session_id cannot be empty")
-
-    client_id = f"{request.client.host}:{request.client.port}"
-    update_pairing(session_id, client_id)
-
-    cmd = req.command_apdu.upper().replace(" ", "")
-    last_apdu_per_session[session_id] = cmd
-
-    paired = session_status.get(session_id) == "paired"
-
-    logger.info(
-        f"[APDU] session={session_id} client={client_id} paired={paired}"
-    )
-
-    return ApduResponse(response_apdu="9000", paired=paired)
+@app.get("/ping")
+async def ping():
+    return {"status": "ok"}
 
 
 @app.post("/tag/event")
@@ -240,57 +149,38 @@ async def tag_event(
     check_auth(authorization)
 
     client_id = f"{request.client.host}:{request.client.port}"
-    update_pairing(event.session_id, client_id)
+    register_role(event.session_id, event.type, client_id)
 
-    paired = session_status.get(event.session_id) == "paired"
+    paired = is_paired(event.session_id)
 
     logger.info(
-        f"[TAG EVENT] session={event.session_id} client={client_id} paired={paired}"
+        f"[ROLE] session={event.session_id} roles={session_roles.get(event.session_id)}"
     )
 
-    return {"status": "ok", "paired": paired}
+    return {"paired": paired}
 
 
-@app.get("/session/status", response_model=SessionStatusResponse)
-async def get_session_status(
-    session_id: str,
+@app.post("/apdu", response_model=ApduResponse)
+async def apdu(
+    req: ApduRequest,
+    request: Request,
     authorization: Optional[str] = Header(None)
 ):
     check_auth(authorization)
 
-    clients = len(session_clients.get(session_id, set()))
-    status = session_status.get(session_id, "waiting")
+    last_apdu[req.session_id] = req.command_apdu
+    paired = is_paired(req.session_id)
 
-    return SessionStatusResponse(
-        session_id=session_id,
-        status=status,
-        clients=clients
+    logger.info(
+        f"[APDU] session={req.session_id} paired={paired}"
     )
 
-
-@app.post("/nfc-bin")
-async def handle_nfc_bin(request: Request):
-    data = await request.body()
-    if not data:
-        raise HTTPException(status_code=400, detail="Empty body")
-
-    response_data = process_nfc_bin(data)
-    return Response(content=response_data, media_type="application/octet-stream")
+    return ApduResponse(response_apdu="9000", paired=paired)
 
 
-# =========================
-# NFC BINARY PROCESSING
-# =========================
-
-def process_nfc_bin(data: bytes) -> bytes:
-    command_type = data[0:1]
-
-    if command_type == b"\x01":
-        return b"ACK: Comanda 1 procesata"
-    elif command_type == b"\x02":
-        return b"ACK: Comanda 2 procesata"
-    else:
-        return b"Error: Comanda necunoscuta"
+@app.get("/session/roles")
+async def roles(session_id: str):
+    return session_roles.get(session_id, {})
 
 
 # =========================
@@ -300,13 +190,5 @@ def process_nfc_bin(data: bytes) -> bytes:
 if __name__ == "__main__":
     import uvicorn
 
-    port = int(os.getenv("PORT", str(settings.default_port)))
-    logger.info(f"Pornesc {SERVER_NAME} pe portul {port}")
-
-    uvicorn.run(
-        "server:app",
-        host="0.0.0.0",
-        port=port,
-        reload=False,
-        workers=1
-    )
+    port = int(os.getenv("PORT", settings.default_port))
+    uvicorn.run("server:app", host="0.0.0.0", port=port)

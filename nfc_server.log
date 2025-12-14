@@ -52,3 +52,4 @@
 2025-12-14 19:33:38 [INFO] nfc_server - Pornit cu setările: server_name=NFC Remote Server, version=1.0.0, port=5050, log_level=INFO
 2025-12-14 19:33:38 [INFO] nfc_server - Pornit cu setările: server_name=NFC Remote Server, version=1.0.0, port=5050, log_level=INFO
 2025-12-14 20:02:08 [INFO] nfc_server - Pornesc NFC Remote Server pe portul 5050
+2025-12-14 21:01:05 [INFO] nfc_server - Pornesc NFC Remote Server pe portul 8000
