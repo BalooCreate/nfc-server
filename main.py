@@ -6,6 +6,7 @@ from fastapi import FastAPI, Header, HTTPException, Request, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, BaseSettings
+from fastapi.responses import Response
 
 # ==============================
 #   CONFIG PRODUS (din .env)
@@ -342,13 +343,13 @@ def process_nfc_bin(data: bytes) -> bytes:
     # Implementarea logicii pentru comenzi
     if command_type == b'\x01':
         logger.info("Comandă de tip 1 primită")
-        return b"ACK: Comandă 1 procesată"
+        return b"ACK: Comanda 1 procesata"
     elif command_type == b'\x02':
         logger.info("Comandă de tip 2 primită")
-        return b"ACK: Comandă 2 procesată"
+        return b"ACK: Comanda 2 procesata"
     
     logger.warning("Comandă necunoscută primită")
-    return b"Error: Comandă necunoscută"
+    return "Error: Comandă necunoscută"
 
 # ==============================
 #   PORNIRE UVICORN (pt. stand-alone)
