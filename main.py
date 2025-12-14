@@ -144,22 +144,19 @@ async def ping():
 
 @app.post("/tag/event")
 async def tag_event(
-    event: TagEvent,
+    event: dict,
     request: Request,
     authorization: Optional[str] = Header(None)
 ):
     check_auth(authorization)
 
     client_id = f"{request.client.host}:{request.client.port}"
-    register_role(event.session_id, event.type, client_id)
 
-    paired = is_paired(event.session_id)
-
-    logger.info(
-        f"[ROLE] session={event.session_id} roles={session_roles.get(event.session_id)}"
+    logger.warning(
+        f"[RAW TAG EVENT] from={client_id} payload={event}"
     )
 
-    return {"paired": paired}
+    return {"status": "received"}
 
 
 @app.post("/apdu", response_model=ApduResponse)
