@@ -152,11 +152,33 @@ async def tag_event(
 
     client_id = f"{request.client.host}:{request.client.port}"
 
-    logger.warning(
-        f"[RAW TAG EVENT] from={client_id} payload={event}"
-    )
+    session_id = event.get("session_id", "").strip()
+    raw_type = str(event.get("type", "")).upper()
 
-    return {"status": "received"}
+    role = None
+    if "READER" in raw_type:
+        role = "reader"
+    elif "TAG" in raw_type or "CARD" in raw_type or "EMULATION" in raw_type:
+        role = "tag"
+
+    if role and session_id:
+        register_role(session_id, role, client_id)
+        logger.info(
+            f"[ROLE SET] session={session_id} role={role} client={client_id}"
+        )
+    else:
+        logger.warning(
+            f"[UNMAPPED EVENT] session={session_id} type={raw_type}"
+        )
+
+    paired = is_paired(session_id)
+
+    return {
+        "status": "ok",
+        "role": role,
+        "paired": paired
+    }
+
 
 
 @app.post("/apdu", response_model=ApduResponse)
