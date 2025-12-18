@@ -2,11 +2,14 @@ import logging
 from logging.handlers import RotatingFileHandler
 from typing import Dict, Optional
 import os
+import json
+import asyncio
 
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, BaseSettings
+from pydantic import BaseModel
+from pydantic_settings import BaseSettings
 
 
 # =========================
@@ -62,17 +65,16 @@ class ApduResponse(BaseModel):
     paired: bool
 
 
-class TagEvent(BaseModel):
-    session_id: str
-    type: str   # reader / tag
-
-
 # =========================
 # STORAGE
 # =========================
 
 session_roles: Dict[str, Dict[str, str]] = {}
 last_apdu: Dict[str, str] = {}
+# Cozi pentru mesaje CĂTRE clienți (reader sau tag)
+active_outboxes: Dict[str, Dict[str, asyncio.Queue]] = {}
+# Cozi temporare pentru așteptarea răspunsului în /apdu
+temp_response_queues: Dict[str, asyncio.Queue] = {}
 
 
 # =========================
@@ -125,7 +127,7 @@ app.add_middleware(
 @app.exception_handler(Exception)
 async def err(_, e: Exception):
     logger.exception(e)
-    return JSONResponse(500, {"error": "internal"})
+    return JSONResponse({"error": "internal"}, status_code=500)
 
 
 # =========================
@@ -151,7 +153,6 @@ async def tag_event(
     check_auth(authorization)
 
     client_id = f"{request.client.host}:{request.client.port}"
-
     session_id = event.get("session_id", "").strip()
     raw_type = str(event.get("type", "")).upper()
 
@@ -163,22 +164,12 @@ async def tag_event(
 
     if role and session_id:
         register_role(session_id, role, client_id)
-        logger.info(
-            f"[ROLE SET] session={session_id} role={role} client={client_id}"
-        )
+        logger.info(f"[ROLE SET] session={session_id} role={role} client={client_id}")
     else:
-        logger.warning(
-            f"[UNMAPPED EVENT] session={session_id} type={raw_type}"
-        )
+        logger.warning(f"[UNMAPPED EVENT] session={session_id} type={raw_type}")
 
     paired = is_paired(session_id)
-
-    return {
-        "status": "ok",
-        "role": role,
-        "paired": paired
-    }
-
+    return {"status": "ok", "role": role, "paired": paired}
 
 
 @app.post("/apdu", response_model=ApduResponse)
@@ -189,14 +180,37 @@ async def apdu(
 ):
     check_auth(authorization)
 
-    last_apdu[req.session_id] = req.command_apdu
-    paired = is_paired(req.session_id)
+    session_id = req.session_id
+    command_apdu = req.command_apdu.strip()
 
-    logger.info(
-        f"[APDU] session={req.session_id} paired={paired}"
-    )
+    if not command_apdu:
+        raise HTTPException(400, "Comandă APDU goală")
 
-    return ApduResponse(response_apdu="9000", paired=paired)
+    # Verifică dacă există un TAG conectat prin WebSocket
+    tag_outbox = active_outboxes.get(session_id, {}).get("tag")
+    if not tag_outbox:
+        logger.warning(f"[APDU] Niciun tag conectat pentru sesiunea {session_id}")
+        return ApduResponse(response_apdu="6A82", paired=False)
+
+    # Trimite comanda către tag
+    await tag_outbox.put({
+        "type": "apdu_request",
+        "command_apdu": command_apdu
+    })
+
+    # Așteaptă răspunsul
+    response_queue = asyncio.Queue()
+    temp_response_queues[session_id] = response_queue
+
+    try:
+        response_apdu = await asyncio.wait_for(response_queue.get(), timeout=8.0)
+    except asyncio.TimeoutError:
+        logger.error(f"[APDU] Timeout pentru sesiunea {session_id}")
+        response_apdu = "6F00"
+    finally:
+        temp_response_queues.pop(session_id, None)
+
+    return ApduResponse(response_apdu=response_apdu, paired=is_paired(session_id))
 
 
 @app.get("/session/roles")
@@ -205,11 +219,113 @@ async def roles(session_id: str):
 
 
 # =========================
-# MAIN (LOCAL ONLY)
+# WEBSOCKET ENDPOINT
+# =========================
+
+@app.websocket("/ws")
+async def nfc_websocket(websocket: WebSocket):
+    await websocket.accept()
+
+    session_id = websocket.query_params.get("session_id")
+    role_param = websocket.query_params.get("role", "").lower()
+    token = websocket.query_params.get("token")
+
+    if not session_id or not role_param:
+        await websocket.close(code=4000, reason="session_id și role obligatorii")
+        return
+
+    if settings.api_key and token != settings.api_key:
+        await websocket.close(code=4003, reason="Token invalid")
+        return
+
+    if role_param in ("reader", "reader_mode"):
+        role = "reader"
+    elif role_param in ("tag", "card", "emulation"):
+        role = "tag"
+    else:
+        await websocket.close(code=4001, reason="Rol necunoscut")
+        return
+
+    outbox = asyncio.Queue()
+    active_outboxes.setdefault(session_id, {})[role] = outbox
+
+    client_id = f"ws:{session_id}:{role}"
+    register_role(session_id, role, client_id)
+
+    logger.info(f"[WS CONNECT] session={session_id} role={role}")
+    await websocket.send_json({"status": "connected", "role": role})
+
+    async def sender():
+        try:
+            while True:
+                msg = await outbox.get()
+                await websocket.send_json(msg)
+        except Exception:
+            pass  # WebSocket închis
+
+    sender_task = asyncio.create_task(sender())
+
+    try:
+        async for message in websocket.iter_text():
+            try:
+                data = json.loads(message)
+                msg_type = data.get("type")
+
+                if role == "tag" and msg_type == "apdu_response":
+                    response_apdu = data.get("response_apdu", "6F00")
+
+                    # Deblocare apel /apdu
+                    resp_q = temp_response_queues.get(session_id)
+                    if resp_q:
+                        try:
+                            resp_q.put_nowait(response_apdu)
+                        except:
+                            pass  # coada închisă
+
+                    # Notificare live reader (opțional)
+                    reader_outbox = active_outboxes.get(session_id, {}).get("reader")
+                    if reader_outbox:
+                        await reader_outbox.put({
+                            "type": "apdu_response",
+                            "response_apdu": response_apdu
+                        })
+
+                elif role == "reader" and msg_type == "apdu_request":
+                    command_apdu = data.get("command_apdu")
+                    if command_apdu:
+                        tag_outbox = active_outboxes.get(session_id, {}).get("tag")
+                        if tag_outbox:
+                            await tag_outbox.put({
+                                "type": "apdu_request",
+                                "command_apdu": command_apdu
+                            })
+                        else:
+                            await outbox.put({
+                                "type": "apdu_response",
+                                "response_apdu": "6A82"
+                            })
+
+            except Exception as e:
+                logger.error(f"[WS] Eroare procesare mesaj: {e}")
+                continue
+
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        logger.error(f"[WS ERROR] {e}")
+    finally:
+        sender_task.cancel()
+        active_outboxes.get(session_id, {}).pop(role, None)
+        if session_id in active_outboxes and not active_outboxes[session_id]:
+            del active_outboxes[session_id]
+        logger.info(f"[WS DISCONNECT] session={session_id} role={role}")
+
+
+# =========================
+# MAIN
 # =========================
 
 if __name__ == "__main__":
     import uvicorn
-
     port = int(os.getenv("PORT", settings.default_port))
     uvicorn.run("main:app", host="0.0.0.0", port=port)
